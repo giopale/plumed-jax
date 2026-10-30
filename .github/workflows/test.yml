@@ -1,0 +1,32 @@
+name: Test
+on: [push, pull_request]
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install build
+      - run: python -m build
+      - run: python -m pip install pytest dist/*.whl
+      - name: Test the installed wheel outside the checkout
+        env:
+          JAX_ENABLE_X64: 'true'
+        run: |
+          mkdir /tmp/plumed-installed
+          cp -R tests examples /tmp/plumed-installed/
+          cd /tmp/plumed-installed
+          python -c 'import plumed_jax; print(plumed_jax.__file__)'
+          python -m pytest -q tests
+          python examples/umbrella.py
+          python examples/well_tempered.py
+          python examples/multiple_walkers.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions-${{ matrix.python }}
+          path: dist/

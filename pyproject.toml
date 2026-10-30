@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "plumed-jax"
+version = "0.2.0"
+description = "Selected PLUMED collective variables and enhanced sampling in JAX"
+readme = "README.md"
+authors = [{name = "Venkat Kapil"}]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.10"
+dependencies = ["jax>=0.4.30", "numpy>=1.26"]
+
+[project.urls]
+Repository = "https://github.com/venkatkapil24/plumed-jax"
+Documentation = "https://github.com/venkatkapil24/plumed-jax/blob/main/README.md"
+Issues = "https://github.com/venkatkapil24/plumed-jax/issues"
+
+[project.optional-dependencies]
+test = ["pytest>=8", "numpy>=1.26"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,13 @@
+PLUMED-JAX
+
+plumed-jax is an AI-assisted adaptation of selected PLUMED functionality
+for JAX-based simulations. It builds on the scientific methods and
+implementation work of PLUMED's developers and contributors.
+
+PLUMED: https://www.plumed.org/
+
+If you use or build upon plumed-jax, please acknowledge PLUMED's developers
+and contributors, and cite the original PLUMED papers and the methods you
+use. See https://www.plumed.org/cite.
+
+This citation request does not add conditions to the Apache License 2.0.

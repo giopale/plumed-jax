@@ -1,0 +1,19 @@
+.plumed-install/
+upstream/
+build-plumed.log
+install-plumed.log
+clean-plumed.log
+parity.log
+.pytest_cache/
+**/__pycache__/
+*.egg-info/
+dist/
+build/
+
+.plumed-extended/
+*-extended.log
+
+# Generated experiments belong outside the public source tree.
+reports/
+.venv/
+.ruff_cache/
