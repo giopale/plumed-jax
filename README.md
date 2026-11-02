@@ -131,22 +131,7 @@ Tests are self-contained and require no PLUMED installation. The frozen PLUMED
 2.10.1 fixtures compare values, coordinate derivatives, and joint coordinate/cell
 deformation derivatives for all 95 scalar outputs and option combinations.
 The exact mapping, inputs, and provenance are in
-`tests/fixtures/plumed-2.10.1.json`. These 494 representative comparisons are
-separate from the full article benchmark.
+`tests/fixtures/plumed-2.10.1.json`.
 
-The installed-wheel suite passed 595 tests on ARM macOS with Python 3.11.6,
-JAX/jaxlib 0.10.2, NumPy 2.4.6, and pytest 9.2.0. One JAX future warning concerns
-float64-to-float32 scatter casting in the float32 walker test with x64 enabled.
-This release check did not rerun GPU verification; earlier A6000 runs covered
-1,190 baseline and 2,232 additional comparisons, with one extrema failure
-followed by a successful 72-case corrected min/max rerun. A CPU pass does not
-establish GPU correctness. CI checks wheel installation and tests on Python
-3.10/3.12; other dependency combinations are not all verified.
-
-Implementation lives in `src/plumed_jax/`: geometry/CV/reference/order functions,
-bias and metadynamics state, and the optional parser. Contributions should stay
-focused and include independent value and coordinate/affine derivative tests,
-explicit units, supported options, and rejected inputs. Keep fixtures small and
-preserve numerical conventions and hill ordering.
 
 Licensed under [Apache 2.0](LICENSE). See [NOTICE](NOTICE) for PLUMED attribution.
