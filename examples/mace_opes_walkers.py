@@ -187,13 +187,16 @@ def main(argv=None):
     parser.add_argument("--kernel-capacity", type=int, default=20000)
     parser.add_argument("--skin", type=float, default=0.5,
                         help="neighbor-list skin in Å (edges up to r_max+skin are evaluated)")
-    parser.add_argument("--cueq", choices=("off", "on", "fused"), default="off",
+    parser.add_argument("--cueq", choices=("off", "on", "fused"), default="fused",
                         help="cuEquivariance kernels for MACE-JAX (validate with --check)")
     parser.add_argument("--capacity-multiplier", type=float, default=1.5)
     parser.add_argument("--neighbor", choices=("auto", "mic", "multi-image"), default="auto",
                         help="minimum-image list, or explicit periodic images for small cells "
                              "(auto: multi-image if a cell height < 2*(r_max+skin))")
     parser.add_argument("--seed", type=int, default=1000)
+    parser.add_argument("--shard", action="store_true",
+                        help="split walkers across all local GPUs (walkers must divide evenly); "
+                             "the OPES state is replicated and updated synchronously")
     parser.add_argument("--outdir", default=".")
     parser.add_argument("--restart", action="store_true")
     parser.add_argument("--max-hours", type=float, default=None)
@@ -336,6 +339,24 @@ def main(argv=None):
         state = jax.tree_util.tree_unflatten(jax.tree_util.tree_structure(state), leaves)
         nbrs = allocate_all(state.position, capacity)
 
+    if args.shard:
+        from jax.sharding import Mesh, NamedSharding, PartitionSpec
+        devices = jax.devices()
+        if walkers % len(devices):
+            raise ValueError(f"--shard needs walkers divisible by {len(devices)} devices")
+        mesh = Mesh(np.array(devices), ("walker",))
+        by_walker = NamedSharding(mesh, PartitionSpec("walker"))
+        replicated = NamedSharding(mesh, PartitionSpec())
+        print(f"sharding {walkers} walkers over {len(devices)} devices")
+
+        def place(state, nbrs, bias_state, step):
+            return (jax.device_put(state, by_walker), jax.device_put(nbrs, by_walker),
+                    jax.device_put(bias_state, replicated), jax.device_put(step, replicated))
+    else:
+        def place(*carry):
+            return carry
+    state, nbrs, bias_state, step = place(state, nbrs, bias_state, step)
+
     block = build_block(args.print_every)
     colvar = [open(out / f"COLVAR.{w}", "a") for w in range(walkers)]
     cv_names = None
@@ -352,6 +373,7 @@ def main(argv=None):
             print(f"neighbor list overflow: reallocating with capacity {capacity}")
             state, _, bias_state, step = previous
             nbrs = allocate_all(state.position, capacity)
+            state, nbrs, bias_state, step = place(state, nbrs, bias_state, step)
             block = build_block(args.print_every)
             continue
         bad = [label for label in opes_labels if bool(bias_state[label].overflow)]
