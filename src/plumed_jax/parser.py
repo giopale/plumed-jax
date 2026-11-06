@@ -11,11 +11,13 @@ from jax import Array, custom_jvp
 from jax.typing import ArrayLike
 from .metadynamics import HillState
 from .grid_metadynamics import GridState
+from .opes import OPESMetad, OPESState
 from dataclasses import dataclass
 from functools import lru_cache
 import ast
 import re
 from pathlib import Path
+import jax
 import jax.numpy as jnp
 import numpy as np
 from . import cvs
@@ -221,6 +223,27 @@ _ALLOWED = {
         "GRID_BIN",
         "GRID_SPACING",
     },
+    "OPES_METAD": {
+        "ARG",
+        "PACE",
+        "BARRIER",
+        "TEMP",
+        "SIGMA",
+        "SIGMA_MIN",
+        "ADAPTIVE_SIGMA_STRIDE",
+        "BIASFACTOR",
+        "EPSILON",
+        "KERNEL_CUTOFF",
+        "COMPRESSION_THRESHOLD",
+        "FIXED_SIGMA",
+        "RECURSIVE_MERGE_OFF",
+        "NO_ZED",
+        "CALC_WORK",
+        "WALKERS_MPI",
+        "SERIAL",
+        "FILE",
+        "FMT",
+    },
     "PRINT": {"ARG", "FILE", "STRIDE", "FMT"},
 }
 _REQUIRED = {
@@ -240,9 +263,21 @@ _REQUIRED = {
     "UPPER_WALLS": {"ARG", "AT", "KAPPA"},
     "LOWER_WALLS": {"ARG", "AT", "KAPPA"},
     "METAD": {"ARG", "SIGMA", "HEIGHT", "PACE"},
+    "OPES_METAD": {"ARG", "PACE", "BARRIER", "TEMP"},
     "PRINT": {"ARG"},
 }
-_FLAGS = {"NOPBC", "SQUARED", "NORMALIZE"}
+_FLAGS = {
+    "NOPBC",
+    "SQUARED",
+    "NORMALIZE",
+    "FIXED_SIGMA",
+    "RECURSIVE_MERGE_OFF",
+    "NO_ZED",
+    "CALC_WORK",
+    "WALKERS_MPI",
+    "SERIAL",
+}
+_STATEFUL_BIASES = ("METAD", "OPES_METAD")
 _GEOMETRY_ATOM_COUNTS = {"DISTANCE": 2, "ANGLE": 3, "TORSION": 4}
 _CELL_GEOMETRY_ACTIONS = (
     *_GEOMETRY_ATOM_COUNTS,
@@ -350,10 +385,13 @@ def _validate_action(name, opts, actions):
             "EXP",
             "OFFSET",
             "SIGMA",
+            "SIGMA_MIN",
             "COEFFICIENTS",
             "PARAMETERS",
             "POWERS",
         ):
+            if key == "SIGMA" and str(opts.get(key)).upper() == "ADAPTIVE":
+                continue
             if key in opts and len(_numbers(opts[key])) != n_args:
                 raise ValueError(f"{key} needs one value per ARG")
 
@@ -456,6 +494,53 @@ def _metadynamics_config(opts, units, periods, hill_capacity):
     )
 
 
+def _opes_config(opts, units, periods, lower, capacity, walkers):
+    """Construct OPESMetad from validated OPES_METAD options."""
+    from .metadata import ENERGY_TO_EV
+
+    args = opts["ARG"].split(",")
+    kT = (
+        0.0083144621
+        * float(opts["TEMP"])
+        * ENERGY_TO_EV["kj/mol"]
+        / ENERGY_TO_EV[units.energy]
+    )
+    sigma = opts.get("SIGMA", "ADAPTIVE")
+    adaptive = str(sigma).upper() == "ADAPTIVE"
+    factor = opts.get("BIASFACTOR")
+    if factor is not None:
+        factor = float("inf") if factor.upper() == "INF" else float(factor)
+    stride = opts.get("ADAPTIVE_SIGMA_STRIDE")
+    if stride is not None and not re.fullmatch(r"\d+", stride):
+        raise ValueError("ADAPTIVE_SIGMA_STRIDE must be an integer")
+    if not re.fullmatch(r"\d+", opts["PACE"]):
+        raise ValueError("PACE must be an integer")
+    cv_periods = tuple(periods.get(arg, 0.0) for arg in args)
+    return OPESMetad(
+        sigma="adaptive" if adaptive else _numbers(sigma),
+        barrier=float(opts["BARRIER"]),
+        pace=int(opts["PACE"]),
+        capacity=capacity,
+        kT=kT,
+        periods=cv_periods if any(cv_periods) else (),
+        periodic_min=tuple(lower.get(arg, -p / 2) for arg, p in zip(args, cv_periods))
+        if any(cv_periods)
+        else (),
+        bias_factor=factor,
+        epsilon=float(opts["EPSILON"]) if "EPSILON" in opts else None,
+        kernel_cutoff=float(opts["KERNEL_CUTOFF"]) if "KERNEL_CUTOFF" in opts else None,
+        compression_threshold=float(opts.get("COMPRESSION_THRESHOLD", 1.0)),
+        sigma_min=_numbers(opts["SIGMA_MIN"]) if "SIGMA_MIN" in opts else (),
+        adaptive_sigma_stride=None if stride is None else int(stride),
+        fixed_sigma="FIXED_SIGMA" in opts,
+        recursive_merge="RECURSIVE_MERGE_OFF" not in opts,
+        no_zed="NO_ZED" in opts,
+        calc_work="CALC_WORK" in opts,
+        walkers=walkers if "WALKERS_MPI" in opts else 1,
+        dimension=len(args) if adaptive else None,
+    )
+
+
 def _coordination(positions, group_a, group_b, options, cell):
     """Evaluate simplified rational or explicit SWITCH coordination."""
     if "SWITCH" not in options:
@@ -518,13 +603,20 @@ def _coordination(positions, group_a, group_b, options, cell):
 
 
 def parse(
-    text: str, *, base_dir: str | Path = ".", hill_capacity: int = 1024
+    text: str,
+    *,
+    base_dir: str | Path = ".",
+    hill_capacity: int = 1024,
+    walkers: int = 1,
 ) -> Program:
     """Construct a Program from the documented PLUMED input subset, outside JIT.
 
     text is the input string; base_dir resolves PDB REFERENCE paths.
-    hill_capacity fixes direct-history METAD storage (default 1024); grid
-    METAD uses its specified bounds/bins instead. Defaults are nm, kJ/mol,
+    hill_capacity fixes direct-history METAD storage and the compressed
+    kernel capacity of OPES_METAD (default 1024); grid METAD uses its
+    specified bounds/bins instead. walkers is the number of synchronous
+    replicas for OPES_METAD ... WALKERS_MPI (default 1); with walkers > 1
+    every OPES_METAD action must declare WALKERS_MPI. Defaults are nm, kJ/mol,
     ps unless UNITS overrides them. Coordinates must already use these units.
     Unsupported actions/options/dependencies raise ValueError; numeric and
     file errors propagate. PRINT/FILE/FMT do not write output. Atom bounds
@@ -536,7 +628,10 @@ def parse(
     references = {}
     expressions = {}
     periods = {}
+    lower = {}
     metad = {}
+    if type(walkers) is not int or walkers < 1:
+        raise ValueError("walkers must be a positive integer")
     for line in _action_lines(text):
         label, name, opts = _read_action(line)
         if name == "UNITS":
@@ -564,6 +659,7 @@ def parse(
             expressions[label] = _expression(opts["FUNC"])
         if name == "TORSION":
             periods[label] = 2 * np.pi
+            lower[label] = -np.pi
         elif name in ("COMBINE", "CUSTOM"):
             declared = opts.get("PERIODIC")
             if declared is None:
@@ -572,10 +668,18 @@ def parse(
             if bounds is not None and (len(bounds) != 2 or bounds[1] <= bounds[0]):
                 raise ValueError("Invalid periodic interval")
             periods[label] = 0.0 if bounds is None else bounds[1] - bounds[0]
+            if bounds is not None:
+                lower[label] = bounds[0]
         else:
             periods.setdefault(label, 0.0)
         if name == "METAD":
             metad[label] = _metadynamics_config(opts, units, periods, hill_capacity)
+        if name == "OPES_METAD":
+            if walkers > 1 and "WALKERS_MPI" not in opts:
+                raise ValueError("OPES_METAD with walkers>1 requires WALKERS_MPI")
+            metad[label] = _opes_config(
+                opts, units, periods, lower, hill_capacity, walkers
+            )
     return Program(
         tuple(actions), units, groups, references, expressions, periods, metad
     )
@@ -598,14 +702,14 @@ class Program:
     references: dict
     expressions: dict[str, Callable]
     periods: dict[str, float]
-    metad: dict[str, Metadynamics | GridMetadynamics]
+    metad: dict[str, Metadynamics | GridMetadynamics | OPESMetad]
 
     def __post_init__(self):
         for action in self.actions:
             if action.name in _GEOMETRY_ATOM_COUNTS and "ATOMS" in action.options:
                 _geometry_selection(action.options["ATOMS"])
 
-    def initial_state(self) -> dict[str, HillState | GridState]:
+    def initial_state(self) -> dict[str, HillState | GridState | OPESState]:
         """Return a dictionary mapping METAD labels to fresh hill/grid states.
 
         The dictionary is empty without METAD actions. Floating arrays default
@@ -707,6 +811,7 @@ class Program:
                 "GROUP",
                 "PRINT",
                 "METAD",
+                "OPES_METAD",
                 "RESTRAINT",
                 "UPPER_WALLS",
                 "LOWER_WALLS",
@@ -841,7 +946,7 @@ class Program:
         cell: ArrayLike | PreparedCell | None = None,
         *,
         masses: ArrayLike | None = None,
-        state: dict[str, HillState | GridState] | None = None,
+        state: dict[str, HillState | GridState | OPESState] | None = None,
         share_geometry: bool = False,
     ) -> Array:
         """Return the scalar sum of restraints, walls, and METAD bias energies.
@@ -861,11 +966,13 @@ class Program:
         metad_energies = {}
         for action in self.actions:
             options = action.options
-            if action.name not in ("RESTRAINT", "METAD", "UPPER_WALLS", "LOWER_WALLS"):
+            if action.name not in (
+                "RESTRAINT", *_STATEFUL_BIASES, "UPPER_WALLS", "LOWER_WALLS"
+            ):
                 continue
             args = options["ARG"].split(",")
             v = jnp.array([values[t] for t in args])
-            if action.name == "METAD":
+            if action.name in _STATEFUL_BIASES:
                 if state is None or action.label not in state:
                     raise ValueError("Explicit METAD state is required")
                 term = self.metad[action.label].energy(v, state[action.label])
@@ -894,14 +1001,14 @@ class Program:
     def update(
         self,
         positions: Array,
-        state: dict[str, HillState | GridState],
+        state: dict[str, HillState | GridState | OPESState],
         cell: ArrayLike | PreparedCell | None = None,
         *,
         masses: ArrayLike | None = None,
         step: ArrayLike | None = None,
         bias_energies: dict[str, ArrayLike] | None = None,
         share_geometry: bool = False,
-    ) -> dict[str, HillState | GridState]:
+    ) -> dict[str, HillState | GridState | OPESState]:
         """Return a dictionary of next METAD histories after force evaluation.
 
         positions/cell/masses follow values; state maps METAD labels to histories.
@@ -926,19 +1033,19 @@ class Program:
                 bias_energy=energies.get(action.label),
             )
             for action in self.actions
-            if action.name == "METAD"
+            if action.name in _STATEFUL_BIASES
         }
 
     def bias_and_update(
         self,
         positions: Array,
-        state: dict[str, HillState | GridState],
+        state: dict[str, HillState | GridState | OPESState],
         cell: ArrayLike | PreparedCell | None = None,
         *,
         masses: ArrayLike | None = None,
         step: ArrayLike | None = None,
         share_geometry: bool = False,
-    ) -> tuple[Array, dict[str, HillState | GridState]]:
+    ) -> tuple[Array, dict[str, HillState | GridState | OPESState]]:
         """Return (scalar pre-deposition bias energy, next METAD state dictionary).
 
         positions/cell/masses follow values; state/step follow update. CVs and
@@ -952,3 +1059,73 @@ class Program:
         )
         energy, metad_energies = self._bias_from_values(values, positions.dtype, state)
         return energy, self._update_from_values(values, state, step, metad_energies)
+
+    def _walker_values(self, positions, cell, masses, share_geometry):
+        if positions.ndim != 3:
+            raise ValueError("Walker positions must have shape (walkers, atoms, 3)")
+        return jax.vmap(
+            lambda r: self.values(r, cell, masses=masses, share_geometry=share_geometry)
+        )(positions)
+
+    def _update_walkers_from_values(self, values, state, step, bias_energies):
+        energies = {} if bias_energies is None else bias_energies
+        return {
+            action.label: self.metad[action.label].update_walkers(
+                jnp.stack(
+                    [values[t] for t in action.options["ARG"].split(",")], axis=-1
+                ),
+                state[action.label],
+                step=step,
+                bias_energies=energies.get(action.label),
+            )
+            for action in self.actions
+            if action.name in _STATEFUL_BIASES
+        }
+
+    def update_walkers(
+        self,
+        positions: Array,
+        state: dict[str, HillState | GridState | OPESState],
+        cell: ArrayLike | PreparedCell | None = None,
+        *,
+        masses: ArrayLike | None = None,
+        step: ArrayLike | None = None,
+        bias_energies: dict[str, Array] | None = None,
+        share_geometry: bool = False,
+    ) -> dict[str, HillState | GridState | OPESState]:
+        """Synchronously update every shared bias from a batch of walkers.
+
+        positions has shape (walkers, atoms, 3); cell and masses are shared by
+        all walkers. Each METAD/OPES_METAD history receives one deposit per
+        walker through its update_walkers method (OPES_METAD requires
+        WALKERS_MPI and parse(..., walkers=W)). bias_energies optionally maps
+        each label to its (walkers,) energies from the old state. Check every
+        returned state's overflow on the host; the input is not mutated.
+        """
+        values = self._walker_values(positions, cell, masses, share_geometry)
+        return self._update_walkers_from_values(values, state, step, bias_energies)
+
+    def bias_and_update_walkers(
+        self,
+        positions: Array,
+        state: dict[str, HillState | GridState | OPESState],
+        cell: ArrayLike | PreparedCell | None = None,
+        *,
+        masses: ArrayLike | None = None,
+        step: ArrayLike | None = None,
+        share_geometry: bool = False,
+    ) -> tuple[Array, dict[str, HillState | GridState | OPESState]]:
+        """Return ((walkers,) pre-deposition bias energies, next shared state).
+
+        positions has shape (walkers, atoms, 3). All walkers read the same old
+        state, then update_walkers deposits synchronously; CVs and individual
+        bias energies are evaluated once. For forces differentiate the sum of
+        the returned energies (walkers are independent) with has_aux=True.
+        """
+        values = self._walker_values(positions, cell, masses, share_geometry)
+        energies, metad_energies = jax.vmap(
+            lambda v: self._bias_from_values(v, positions.dtype, state)
+        )(values)
+        return energies, self._update_walkers_from_values(
+            values, state, step, metad_energies
+        )

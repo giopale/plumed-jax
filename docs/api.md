@@ -113,26 +113,87 @@ The grid's `dense` option is also accepted by `update_walkers` and remains stati
 There are no configuration exchanges or distributed communications in this API.
 Checkpoint the shared bias and all engine states together for a restart.
 
+## OPES_METAD
+
+`OPESMetad` follows PLUMED 2.10's `OPES_METAD`. The bias is
+`V(s) = (1-1/γ) kT log(P(s)/Z + ε)`, where `P` is a weighted density estimate
+built from truncated Gaussian kernels that are compressed on the fly.
+`OPESState` holds the kernels and running sums. Kernel slots are fixed by
+`capacity`.
+
+| PLUMED keyword | `OPESMetad` field |
+|---|---|
+| `ARG` periodicity | `periods` (and optional `periodic_min` for the domain lower bound) |
+| `SIGMA` | `sigma` tuple, or `"adaptive"` with `dimension` |
+| `BARRIER`, `PACE`, `TEMP` | `barrier`, `pace`, `kT` (energy units) |
+| `BIASFACTOR` | `bias_factor`; `None` uses `barrier/kT`, `float("inf")` is a uniform target |
+| `EPSILON`, `KERNEL_CUTOFF` | `epsilon`, `kernel_cutoff`; `None` uses the barrier-derived defaults |
+| `COMPRESSION_THRESHOLD`, `SIGMA_MIN`, `ADAPTIVE_SIGMA_STRIDE` | same names in lowercase |
+| `FIXED_SIGMA`, `NO_ZED`, `CALC_WORK`, `RECURSIVE_MERGE_OFF` | `fixed_sigma`, `no_zed`, `calc_work`, `recursive_merge=False` |
+| `WALKERS_MPI` with W replicas | `walkers=W` and `update_walkers` |
+| `EXTRA_BIAS` | `extra_bias` / `extra_biases` argument of `update` / `update_walkers` |
+
+| Method | Inputs and return |
+|---|---|
+| `init(dtype=...)` | Fresh `OPESState`; the bias starts at `kT(1-1/γ) log ε` (−BARRIER by default) |
+| `energy(values, state)` | `(D,)` CVs → scalar bias; differentiate for forces |
+| `update(values, state, step=, bias_energy=, extra_bias=)` | One-walker deposit/compression; requires `walkers=1` |
+| `update_walkers(values, state, ...)` | `(W, D)` CVs → next shared state, synchronous like WALKERS_MPI |
+| `replay(values, state=None)` | `(T, D)` or `(T, W, D)` CV trajectory → `(final_state, pre-deposition energies)` |
+| `probability`, `free_energy` | Normalized density estimate; `-V/(1-1/γ)` regularized free-energy estimate |
+| `diagnostics(state)` | PLUMED components `rct`, `zed`, `neff`, `nker` (and `work`) |
+
+The step convention is the same as for metadynamics. `init()` is PLUMED's state
+after its skipped step zero, and step `n` deposits when `n % pace == 0`. Reweight
+samples with `exp(V/kT)`; OPES needs no `c(t)` correction. With adaptive sigma,
+call `update` at every step, because the CV variance is measured on every step.
+
+**Walkers.** As in WALKERS_MPI, every walker's weight uses its own bias from the
+same old state. The summed weights set `n_eff` and the shrunk sigma, kernels are
+added and compressed in walker order, and `Z` is updated once. `counter`
+advances by `W`. Adaptive-sigma statistics are kept per walker. Walkers run in
+one process. Batch their engines with `vmap`, as in `examples/opes.py`.
+
+**Capacity and failures.** A deposit that would need a new kernel slot when
+none is free, or that produces nonfinite values, writes nothing, not even the
+weight sums, and sets the sticky `overflow` flag. A PLUMED run with adaptive
+sigma aborts when the first measured sigma is below 1e-6 and no `SIGMA_MIN` is
+set; here the same case sets `overflow` instead.
+
+**Restart.** `checkpoint.save/load` store every state array, including the
+per-walker adaptive statistics. Resuming is byte-identical to an uninterrupted
+run. PLUMED STATE and KERNELS text files are not read or written.
+
+Not implemented: `OPES_METAD_EXPLORE`, `OPES_EXPANDED`, `NLIST`,
+`EXCLUDED_REGION`, `STORE_STATES` and file I/O. `Z` is recomputed in full,
+O(K²), at each deposit. PLUMED switches to an incremental update when there are
+many kernels; the two differ only in rounding.
+
+## Checkpoints and reweighting
+
 `plumed_jax.checkpoint.save(path, state, config)` and `load(path, config)` perform
 host file operations outside JIT. Loading checks configuration, shapes, and
-precision. `metadynamics_offset(bias_grid, kT=..., bias_factor=...)` is the
+precision for hill, grid, and OPES states. `metadynamics_offset(bias_grid, kT=..., bias_factor=...)` is the
 standalone reweighting normalization for a uniform one-dimensional array of
 grid-point bias values, including flattened multidimensional grids.
 
 ## Parsed programs
 
 `from plumed_jax.parser import parse` is the text entry point.
-`parse(text, base_dir='.', hill_capacity=1024)` constructs a `Program` outside
-JIT. `base_dir` resolves reference PDB paths; `hill_capacity` applies to direct
-METAD actions. Unsupported actions and options raise errors.
+`parse(text, base_dir='.', hill_capacity=1024, walkers=1)` constructs a `Program`
+outside JIT. `base_dir` resolves reference PDB paths; `hill_capacity` applies to
+direct METAD actions and OPES_METAD kernels. `walkers` is the replica count for
+OPES_METAD actions that declare `WALKERS_MPI`. Unsupported actions and options raise errors.
 
 | Method | Return and state behavior |
 |---|---|
-| `initial_state()` | Dictionary from each METAD label to an empty bias state |
+| `initial_state()` | Dictionary from each METAD/OPES_METAD label to an empty bias state |
 | `values(positions, cell=None, ...)` | Dictionary of CV arrays keyed by action/component label; requires masses for COM |
 | `bias(positions, cell=None, state=..., ...)` | Scalar total bias energy; requires explicit history for every METAD action |
 | `update(positions, state, cell=None, ...)` | Next METAD state dictionary; no mutation of input state |
 | `bias_and_update(positions, state, cell=None, ...)` | `(pre_deposition_energy, next_state)`; shares CV and individual bias evaluations |
+| `update_walkers(positions, state, cell=None, ...)` | `(W, N, 3)` positions → next shared state for every METAD/OPES_METAD action |
+| `bias_and_update_walkers(positions, state, cell=None, ...)` | `((W,) pre-deposition energies, next shared state)`; differentiate the summed energies for per-walker forces |
 
 Compile `jax.value_and_grad(program.bias_and_update, has_aux=True)` to receive
 `((energy, next_state), gradient)`. State is auxiliary output; forces use the old
@@ -166,6 +227,13 @@ values to a supported target unit.
   Defaults use sigma/5 spacing; both bin and spacing options select the finer grid.
   Native grid c(t) is available through the API; CALC_RCT/RCT_USTRIDE input options,
   GRID_WFILE/GRID_RFILE and sparse/no-spline grid variants remain unsupported.
+- `OPES_METAD`: ARG, PACE, BARRIER, TEMP (required: the parser has no engine
+  temperature), SIGMA (numbers or ADAPTIVE, the default), SIGMA_MIN,
+  ADAPTIVE_SIGMA_STRIDE, BIASFACTOR (number or inf), EPSILON, KERNEL_CUTOFF,
+  COMPRESSION_THRESHOLD, FIXED_SIGMA, RECURSIVE_MERGE_OFF, NO_ZED, CALC_WORK,
+  WALKERS_MPI, and SERIAL (ignored). FILE/FMT are descriptive metadata.
+  STATE_RFILE/STATE_WFILE, NLIST, EXCLUDED_REGION and EXTRA_BIAS raise errors;
+  use NPZ checkpoints and the direct API's `extra_bias` instead.
 - `PRINT`: ARG/FILE/STRIDE/FMT are descriptive metadata. The caller implements
   output scheduling/writing; parsing does not produce files.
 
@@ -181,8 +249,8 @@ separate cached energies for each METAD action. The direct APIs expose
 
 ## Scope limits
 
-Selections and array sizes are static. There is no OPES implementation,
-neighbor-list builder, adaptive hill covariance, distributed walker communication, or PLUMED HILLS/grid
+Selections and array sizes are static. OPES is limited to OPES_METAD (no
+EXPLORE/EXPANDED variants). There is no neighbor-list builder, adaptive hill covariance, distributed walker communication, or PLUMED HILLS/grid
 file restart. RMSD supports SIMPLE/OPTIMAL alignment and optional squaring;
 PATHMSD uses optimal squared RMSD. Q_l has conventional and PLUMED normalization;
 angular water order requires four explicit neighbors and is not PLUMED's

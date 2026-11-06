@@ -59,12 +59,13 @@ print('forces (eV/Å):', forces)
 ```
 
 Small runnable examples show umbrella sampling, well-tempered metadynamics,
-and multiple walkers sharing a bias:
+multiple walkers sharing a bias, and OPES_METAD walkers with a restart:
 
 ```sh
 python examples/umbrella.py
 python examples/well_tempered.py
 python examples/multiple_walkers.py
+python examples/opes.py
 ```
 
 These use a toy potential and 20 integration steps. They show pre-deposition
@@ -106,12 +107,13 @@ as a numerical reference and is not needed at runtime.
 | Geometry | Distance, Cartesian position, angle, torsion, ordered COM, gyration, proton-transfer distance difference |
 | Contacts | Rational, EXP, GAUSSIAN, TANH, SMAP, COSINUS, CUBIC switches; coordination and static contact matrices |
 | Reference/order | Weighted SIMPLE/OPTIMAL RMSD, PATHMSD, Steinhardt Q_l, explicit four-neighbor angular water order |
-| Bias/sampling | Harmonic restraints/slopes, upper/lower walls, ordinary/well-tempered metadynamics, 1–3D grids, synchronous shared walkers, NPZ checkpoints |
+| Bias/sampling | Harmonic restraints/slopes, upper/lower walls, ordinary/well-tempered metadynamics, 1–3D grids, OPES_METAD (compression, adaptive sigma, WALKERS_MPI-style shared walkers), synchronous shared walkers, NPZ checkpoints |
 | Composition | Strict optional text parser, CONSTANT, COMBINE, restricted CUSTOM expressions |
 
 Support is limited to the documented options. Unsupported functionality includes
 general PLUMED input compatibility, dynamic atom selection, neighbor-list construction,
-OPES, adaptive hills, HILLS text restart, distributed walker synchronization, or
+OPES_METAD_EXPLORE/OPES_EXPANDED and OPES NLIST/EXCLUDED_REGION, adaptive hills,
+HILLS/OPES STATE text restart, distributed walker synchronization, or
 PLUMED file-output scheduling. Water angular order is not PLUMED's TETRAHEDRAL
 action. Q_l normalization and rational cutoff defaults must be chosen explicitly
 when comparing different PLUMED actions.
@@ -132,6 +134,15 @@ Tests are self-contained and require no PLUMED installation. The frozen PLUMED
 deformation derivatives for all 95 scalar outputs and option combinations.
 The exact mapping, inputs, and provenance are in
 `tests/fixtures/plumed-2.10.1.json`.
+
+OPES_METAD is checked against a line-by-line Python transcription of PLUMED's
+`OPESmetad.cpp` (`tests/opes_reference.py`). Direct PLUMED comparisons run when
+`tests/fixtures/opes-plumed.npz` exists; create it with a local PLUMED build
+that includes the `opes` module (MPI is needed only for the walker cases):
+
+```sh
+python tests/fixtures/generate_opes_reference.py --plumed plumed --mpirun "mpirun -np"
+```
 
 
 Licensed under [Apache 2.0](LICENSE). See [NOTICE](NOTICE) for PLUMED attribution.

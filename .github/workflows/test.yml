@@ -26,6 +26,7 @@ jobs:
           python examples/umbrella.py
           python examples/well_tempered.py
           python examples/multiple_walkers.py
+          python examples/opes.py
       - uses: actions/upload-artifact@v4
         with:
           name: distributions-${{ matrix.python }}

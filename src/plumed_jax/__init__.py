@@ -24,6 +24,7 @@ from .metadata import CVMetadata, Units
 from .reweighting import metadynamics_offset
 from .grid_metadynamics import GridMetadynamics, GridState
 from .geometry import prepare_cell
+from .opes import OPESMetad, OPESState
 
 __all__ = [
     "angle",
@@ -53,4 +54,6 @@ __all__ = [
     "GridMetadynamics",
     "GridState",
     "prepare_cell",
+    "OPESMetad",
+    "OPESState",
 ]
