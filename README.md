@@ -93,6 +93,9 @@ usage demonstrations, not converged sampling calculations.
   forces. Cached well-tempered update energies must be from that individual
   bias at the current CV and old state. Shared walkers deposit once per step
   using the same old bias; hill height is per walker.
+- OPES_METAD forces reproduce PLUMED's by default. That force is not the exact
+  gradient of the OPES bias near the kernel cutoff; pass `exact_gradient=True`
+  for conservative forces.
 - Minimum-image derivatives follow the selected image. Image ties, coincident
   atoms, collinear geometry, zero unsquared RMSD, and nonunique alignment can
   be nonsmooth. Very ill-conditioned triclinic cells can be expensive.

@@ -73,6 +73,12 @@ def test_matches_line_by_line_transcription_of_plumed(name):
     if config.adaptive:
         assert int(state.adaptive_counter) == ref.adaptive_counter
         np.testing.assert_allclose(state.av_m2, ref.av_M2, rtol=1e-12)
+    # Forces: the default reproduces PLUMED's derivative formula.
+    gradient = jax.jit(jax.vmap(jax.grad(config.energy), in_axes=(0, None)))
+    probes = x[-1] + np.array([[0.0] * dimension, [0.03] * dimension, [-0.07] * dimension])[:, None]
+    for point in probes.reshape(-1, dimension):
+        np.testing.assert_allclose(gradient(jnp.asarray(point)[None], state)[0],
+                                   ref.bias_derivative(list(point)), rtol=1e-10, atol=1e-11)
     # Unoccupied slots stay inert and finite.
     assert np.all(np.asarray(state.sigmas[k:]) == 1) and np.all(np.asarray(state.heights[k:]) == 0)
 
@@ -113,7 +119,7 @@ def test_initial_bias_forces_and_free_energy():
 def test_forces_are_conservative(periodic):
     options = dict(sigma=(0.2, 0.3), barrier=5.0, pace=1, kT=1.0,
                    periods=(0.0, 2 * np.pi) if periodic else ())
-    config = OPESMetad(**options, capacity=64)
+    config = OPESMetad(**options, capacity=64, exact_gradient=True)
     x = trajectory("forces", 30, 1, 2, periodic)[:, 0]
     state, _ = config.replay(jnp.asarray(x))
     point = jnp.asarray(x[-1]) + jnp.array([0.05, -0.04])
@@ -322,3 +328,22 @@ def test_fixture_generator_reads_plumed_files(tmp_path):
     np.testing.assert_array_equal(module.read_forces(forces, 2)[1, 1], [-4, -5, -6])
     module.write_xyz(tmp_path / "t.xyz", np.ones((1, 2, 3)) / 3)
     assert (tmp_path / "t.xyz").read_text().splitlines()[2] == "X " + " ".join(["0.33333333333333331"] * 3)
+
+
+def test_plumed_and_exact_forces_share_energy_and_differ_by_the_cutoff_shift():
+    exact = OPESMetad(**BASE, capacity=16, exact_gradient=True)
+    plumed = OPESMetad(**BASE, capacity=16)
+    state, _ = exact.replay(jnp.array([[0.0], [0.02], [0.05], [0.1], [0.15]]))
+    tail = np.exp(-0.5 * exact.cutoff**2)
+    single = exact.update(0.0, exact.init(), step=5)  # one kernel at 0
+    for s in (state, single):
+        for x in (0.03, 0.2, 0.4):
+            assert exact.energy(x, s) == plumed.energy(x, s)
+    x = 0.17
+    g_exact = jax.grad(exact.energy)(jnp.array([x]), single)[0]
+    g_plumed = jax.grad(plumed.energy)(jnp.array([x]), single)[0]
+    n2 = (x / float(single.sigmas[0, 0])) ** 2
+    np.testing.assert_allclose(g_plumed / g_exact, 1 - tail / np.exp(-0.5 * n2), rtol=1e-12)
+    eps = 1e-6
+    numerical = (exact.energy(x + eps, single) - exact.energy(x - eps, single)) / (2 * eps)
+    np.testing.assert_allclose(g_exact, numerical, rtol=1e-7)

@@ -96,6 +96,12 @@ class OPESMetad:
     no_zed (NO_ZED), calc_work (CALC_WORK): PLUMED flags.
     walkers: number of synchronous walkers sharing this bias (WALKERS_MPI
         replica count); fixed before JIT.
+    exact_gradient: False (default) reproduces PLUMED's force exactly. PLUMED
+        takes the derivative of each truncated kernel h(exp(-n2/2)-tail) as
+        -(s-c)/sigma**2 * h(exp(-n2/2)-tail), i.e. it keeps the cutoff shift
+        inside the derivative, so its force is not the exact gradient of its
+        bias (the difference vanishes as cutoff -> inf). True uses the exact,
+        conservative autodiff gradient. Energies are identical either way.
 
     Invalid configuration raises ValueError. NLIST, EXCLUDED_REGION,
     OPES_METAD_EXPLORE and STATE/KERNELS text files are not implemented;
@@ -121,6 +127,7 @@ class OPESMetad:
     calc_work: bool = False
     walkers: int = 1
     dimension: int | None = None
+    exact_gradient: bool = False
 
     def __post_init__(self):
         if isinstance(self.sigma, str):
@@ -268,7 +275,17 @@ class OPESMetad:
         cutoff2 = self.cutoff**2
         active = (jnp.arange(centers.shape[0]) < count) & (norm2 < cutoff2)
         tail = exp(-0.5 * cutoff2)
-        return jnp.sum(jnp.where(active, heights * (jnp.exp(-0.5 * norm2) - tail), 0.0))
+        terms = jnp.where(active, heights * (jnp.exp(-0.5 * norm2) - tail), 0.0)
+        if self.exact_gradient:
+            return jnp.sum(terms)
+        # PLUMED's derivative is -(s-c)/sigma**2 times the *shifted* kernel
+        # value. The surrogate below has exactly that gradient with respect
+        # to x and evaluates to exactly zero, so energies are unchanged.
+        weights = jax.lax.stop_gradient(terms)
+        surrogate = jnp.sum(weights * jnp.where(active, -0.5 * norm2, 0.0))
+        return jax.lax.stop_gradient(jnp.sum(terms)) + (
+            surrogate - jax.lax.stop_gradient(surrogate)
+        )
 
     def probability(self, values: ArrayLike, state: OPESState) -> Array:
         """Return the normalized kernel density estimate P(s) (not divided by Z)."""

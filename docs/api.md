@@ -132,6 +132,7 @@ built from truncated Gaussian kernels that are compressed on the fly.
 | `FIXED_SIGMA`, `NO_ZED`, `CALC_WORK`, `RECURSIVE_MERGE_OFF` | `fixed_sigma`, `no_zed`, `calc_work`, `recursive_merge=False` |
 | `WALKERS_MPI` with W replicas | `walkers=W` and `update_walkers` |
 | `EXTRA_BIAS` | `extra_bias` / `extra_biases` argument of `update` / `update_walkers` |
+| (none: PLUMED's force) | `exact_gradient=True` for the conservative autodiff gradient |
 
 | Method | Inputs and return |
 |---|---|
@@ -142,6 +143,16 @@ built from truncated Gaussian kernels that are compressed on the fly.
 | `replay(values, state=None)` | `(T, D)` or `(T, W, D)` CV trajectory → `(final_state, pre-deposition energies)` |
 | `probability`, `free_energy` | Normalized density estimate; `-V/(1-1/γ)` regularized free-energy estimate |
 | `diagnostics(state)` | PLUMED components `rct`, `zed`, `neff`, `nker` (and `work`) |
+
+**Forces.** By default, `jax.grad` of `energy` gives PLUMED's OPES force
+exactly. PLUMED multiplies `-(s-c)/σ²` by the *shifted* kernel value
+`h(exp(-n²/2) - exp(-cutoff²/2))`, so its force is not the exact derivative of
+its bias. The two differ by the factor `1 - exp(-cutoff²/2)/exp(-n²/2)`, which
+is close to one near kernel centres and goes to zero at the cutoff. Set
+`exact_gradient=True` for the exact, conservative gradient, for example for NVE
+energy-conservation checks. Energies are identical in both modes, and parsed
+`OPES_METAD` actions use the PLUMED force. Second derivatives in the default
+mode are those of the PLUMED force.
 
 The step convention is the same as for metadynamics. `init()` is PLUMED's state
 after its skipped step zero, and step `n` deposits when `n % pace == 0`. Reweight

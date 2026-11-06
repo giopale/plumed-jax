@@ -78,6 +78,27 @@ class Reference:
         prob = sum(self.evaluate(k, cv) for k in self.kernels) / self.kde_norm
         return self.kbt * self.prefactor * math.log(prob / self.zed + self.epsilon)
 
+    def bias_derivative(self, cv):
+        """dV/ds exactly as calculate()/evaluateKernel(...,acc_der,dist) do it."""
+        prob, der = 0.0, [0.0] * self.ncv
+        for h, c, sig in self.kernels:
+            dist = [self.difference(i, c[i], cv[i]) / sig[i] for i in range(self.ncv)]
+            norm2 = 0.0
+            for i in range(self.ncv):
+                norm2 += dist[i] * dist[i]
+                if norm2 >= self.cutoff2:
+                    break
+            if norm2 >= self.cutoff2:
+                continue
+            val = h * (math.exp(-0.5 * norm2) - self.val_at_cutoff)
+            for i in range(self.ncv):
+                der[i] -= dist[i] / sig[i] * val
+            prob += val
+        prob /= self.kde_norm
+        der = [d / self.kde_norm for d in der]
+        factor = self.kbt * self.prefactor / (prob / self.zed + self.epsilon) / self.zed
+        return [factor * d for d in der]
+
     def merge(self, k1, k2):
         h = k1[0] + k2[0]
         for i in range(self.ncv):
