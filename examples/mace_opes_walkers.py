@@ -203,6 +203,12 @@ def main(argv=None):
     parser.add_argument("--check", action="store_true",
                         help="compare JAX vs PyTorch MACE energy/forces on walker 0, then continue")
     args = parser.parse_args(argv)
+    # Line-buffered output and a C-level traceback on hard crashes (segfault,
+    # abort), so piped logs show how far a run got.
+    import faulthandler
+    import sys
+    sys.stdout.reconfigure(line_buffering=True)
+    faulthandler.enable()
 
     import jax
     jax.config.update("jax_enable_x64", True)
