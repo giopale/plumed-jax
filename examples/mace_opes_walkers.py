@@ -291,15 +291,22 @@ def main(argv=None):
     force_fn = quantity.force(total_energy)
     pace = {label: program.metad[label].pace for label in opes_labels}
 
-    def build_block(length):
+    def build_block(length, sharded=False):
+        """Compiled block of MD steps. With sharded=True it runs under pmap:
+        each device integrates its own walkers, positions are all-gathered
+        and every device applies the identical shared OPES update."""
+        gather = ((lambda x: jax.lax.all_gather(x, "device", tiled=True)) if sharded
+                  else (lambda x: x))
+
         def one_step(carry, _):
             state, nbrs, bias_state, step = carry
             state = jax.vmap(lambda s, n: apply_fn(s, neighbor=n, bias_state=bias_state))(state, nbrs)
             nbrs = jax.vmap(lambda R, n: n.update(R))(state.position, nbrs)
             step = step + 1
-            # Bias at the new positions with the OLD state, then one synchronous deposit.
+            # Bias at the new positions with the OLD state, then one synchronous
+            # deposit from ALL walkers (gathered across devices when sharded).
             _, new_bias_state = program.bias_and_update_walkers(
-                state.position, bias_state, cell, step=step)
+                gather(state.position), bias_state, cell, step=step)
             due = jnp.any(jnp.array([step % p == 0 for p in pace.values()]))
             # Refresh cached forces when the bias changed.
             state = jax.lax.cond(
@@ -308,7 +315,6 @@ def main(argv=None):
                 lambda s: s, state)
             return (state, nbrs, new_bias_state, step), None
 
-        @jax.jit
         def block(carry):
             carry, _ = jax.lax.scan(one_step, carry, None, length=length)
             state, nbrs, bias_state, step = carry
@@ -318,7 +324,7 @@ def main(argv=None):
             temps = jax.vmap(lambda p, m: quantity.temperature(momentum=p, mass=m))(
                 state.momentum, state.mass) / KB_EV
             return carry, values, biases, pe, temps, jnp.any(nbrs.did_buffer_overflow)
-        return block
+        return jax.pmap(block, axis_name="device") if sharded else jax.jit(block)
 
     # Initial or restarted state.
     md_path = out / "md_state.npz"
@@ -339,43 +345,59 @@ def main(argv=None):
         state = jax.tree_util.tree_unflatten(jax.tree_util.tree_structure(state), leaves)
         nbrs = allocate_all(state.position, capacity)
 
+    tree_map = jax.tree_util.tree_map
     if args.shard:
-        from jax.sharding import Mesh, NamedSharding, PartitionSpec
-        devices = jax.devices()
-        if walkers % len(devices):
-            raise ValueError(f"--shard needs walkers divisible by {len(devices)} devices")
-        mesh = Mesh(np.array(devices), ("walker",))
-        by_walker = NamedSharding(mesh, PartitionSpec("walker"))
-        replicated = NamedSharding(mesh, PartitionSpec())
-        print(f"sharding {walkers} walkers over {len(devices)} devices")
+        devices = jax.local_devices()
+        n_dev = len(devices)
+        if walkers % n_dev:
+            raise ValueError(f"--shard needs walkers divisible by {n_dev} devices")
+        per_device = walkers // n_dev
+        print(f"sharding {walkers} walkers over {n_dev} devices ({per_device} per device)")
 
-        def place(state, nbrs, bias_state, step):
-            return (jax.device_put(state, by_walker), jax.device_put(nbrs, by_walker),
-                    jax.device_put(bias_state, replicated), jax.device_put(step, replicated))
+        def to_device(state, nbrs, bias_state, step):
+            split = lambda t: tree_map(lambda x: x.reshape(n_dev, per_device, *x.shape[1:]), t)
+            copies = lambda t: tree_map(lambda x: jnp.broadcast_to(x, (n_dev,) + jnp.shape(x)), t)
+            return split(state), split(nbrs), copies(bias_state), copies(step)
+
+        def from_device(carry):
+            state, nbrs, bias_state, step = carry
+            merge = lambda t: tree_map(lambda x: x.reshape(walkers, *x.shape[2:]), t)
+            return merge(state), merge(nbrs), tree_map(lambda x: x[0], bias_state), step[0]
+
+        def flat(x):
+            return tree_map(lambda y: np.asarray(y).reshape(walkers, *np.shape(y)[2:]), x)
     else:
-        def place(*carry):
+        def to_device(*carry):
             return carry
-    state, nbrs, bias_state, step = place(state, nbrs, bias_state, step)
 
-    block = build_block(args.print_every)
+        def from_device(carry):
+            return carry
+
+        def flat(x):
+            return tree_map(np.asarray, x)
+
+    block = build_block(args.print_every, args.shard)
+    device_carry = to_device(state, nbrs, bias_state, step)
     colvar = [open(out / f"COLVAR.{w}", "a") for w in range(walkers)]
     cv_names = None
     started = time.time()
     first_block = True
     while int(step) < args.steps:
-        previous = (state, nbrs, bias_state, step)
+        previous = device_carry
         tick = time.time()
-        (state, nbrs, bias_state, step), values, biases, pe, temps, overflow = block(previous)
-        overflow = bool(overflow)  # waits for the device
+        device_carry, values, biases, pe, temps, overflow = block(previous)
+        overflow = bool(np.any(np.asarray(overflow)))  # waits for the devices
         elapsed = time.time() - tick
         if overflow:
             capacity = int(capacity * 1.3) + 1
             print(f"neighbor list overflow: reallocating with capacity {capacity}")
-            state, _, bias_state, step = previous
+            state, _, bias_state, step = from_device(previous)
             nbrs = allocate_all(state.position, capacity)
-            state, nbrs, bias_state, step = place(state, nbrs, bias_state, step)
-            block = build_block(args.print_every)
+            device_carry = to_device(state, nbrs, bias_state, step)
+            block = build_block(args.print_every, args.shard)
             continue
+        state, _, bias_state, step = from_device(device_carry)
+        values, biases, pe, temps = flat(values), flat(biases), flat(pe), flat(temps)
         bad = [label for label in opes_labels if bool(bias_state[label].overflow)]
         if bad:
             raise RuntimeError(f"OPES overflow in {bad}: raise --kernel-capacity or check the CVs")
@@ -404,10 +426,11 @@ def main(argv=None):
               + "  ".join(f"{l}: nker {int(diag[l]['nker'])} neff {float(diag[l]['neff']):.1f}" for l in opes_labels),
               flush=True)
         if n % args.dump_every == 0:
+            positions = np.asarray(state.position)
             for w in range(walkers):
                 with open(out / f"traj.{w}.xyz", "a") as f:
                     f.write(f"{len(symbols)}\nLattice=\"{' '.join(map(str, cell_rows.ravel()))}\" step={n}\n")
-                    for s, x in zip(symbols, np.asarray(state.position[w])):
+                    for s, x in zip(symbols, positions[w]):
                         f.write(f"{s} {x[0]:.6f} {x[1]:.6f} {x[2]:.6f}\n")
         timeout = args.max_hours is not None and time.time() - started > 3600 * args.max_hours
         if n % args.checkpoint_every == 0 or n >= args.steps or timeout:
